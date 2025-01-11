@@ -68,6 +68,14 @@ struct mcu_state {
 	struct port_led_config   portledconfig;
 	struct port_led_map      ledmaps[(MAX_PORT + 7) / 8];
 	struct system_led_config sysledconfig;
+
+	/* bits to control the state machine */
+	uint8_t portled_msgseen:1;
+	uint8_t portled_updsent:1;
+	uint8_t sysled_msgseen:1;
+	uint8_t sysled_updsent:1;
+	uint8_t ledmap_msgseen:1;
+	uint8_t ledmap_updsent:1;
 };
 
 struct config {

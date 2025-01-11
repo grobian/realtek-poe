@@ -502,8 +502,34 @@ static int poe_reply_port_power_stats(struct mcu_state *state, uint8_t *reply)
 	return 0;
 }
 
+/* 0x41 - Set port LED config */
+static int poe_set_port_led_config(struct mcu *mcu, struct mcu_state *state)
+{
+	uint8_t cmd[11];
+
+	/* this function currently doesn't redefine the configuration as set
+	 * by default (bootloader?) but just resubmits it
+	 * TODO: at a later state use config to allow defining the 4 states
+	 * below */
+
+	cmd[0x0] = 0x41;
+	cmd[0x1] = 0x00;
+	cmd[0x2] = state->portledconfig.enable;
+	cmd[0x3] = state->portledconfig.interface;
+	cmd[0x4] = state->portledconfig.shift_order;
+	cmd[0x5] = state->portledconfig.led_count;
+	cmd[0x6] = state->portledconfig.state_off;
+	cmd[0x7] = state->portledconfig.state_req;
+	cmd[0x8] = state->portledconfig.state_err;
+	cmd[0x9] = state->portledconfig.state_on;
+	cmd[0xa] = state->portledconfig.blink_override;
+
+	state->portled_updsent = 1;
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+}
+
 /* 0x42 - Get port LED config */
-static int poe_cmd_port_led_config(struct mcu *mcu, uint8_t port)
+static int poe_cmd_port_led_config(struct mcu *mcu)
 {
 	uint8_t cmd[] = { 0x42, 0x00 };
 
@@ -522,7 +548,31 @@ static int poe_reply_port_led_config(struct mcu_state *state, uint8_t *reply)
 	state->portledconfig.state_on       = reply[0x9];
 	state->portledconfig.blink_override = reply[0xa] & 0x3;
 
+	state->portled_msgseen = 1;
 	return 0;
+}
+
+/* 0x43 - Set system LED config */
+static int poe_set_system_led_config
+(
+	struct mcu          *mcu,
+	struct mcu_state    *state
+)
+{
+	uint8_t cmd[9];
+
+	cmd[0x0] = 0x43;
+	cmd[0x1] = 0x00;
+	cmd[0x2] = state->sysledconfig.sys_ok;
+	cmd[0x3] = state->sysledconfig.in_gb;
+	cmd[0x4] = state->sysledconfig.out_of_gb;
+	cmd[0x5] = state->sysledconfig.exceeds_ps;
+	cmd[0x6] = state->sysledconfig.out_of_gb_off_delay;
+	cmd[0x7] = state->sysledconfig.exceeds_ps_off_delay;
+	cmd[0x8] = state->sysledconfig.map_enable;
+
+	state->sysled_updsent = 1;
+	return mcu_queue_cmd(mcu, cmd, sizeof(cmd));
 }
 
 /* 0x44 - Get system LED config */
@@ -547,7 +597,42 @@ static int poe_reply_system_led_config(struct mcu_state *state, uint8_t *reply)
 	if (state->sysledconfig.map_enable == 0xff)
 		state->sysledconfig.map_enable = 0;
 
+	state->sysled_msgseen = 1;
 	return 0;
+}
+
+/* 0x48 - Set port LED map */
+static int poe_set_port_led_map
+(
+	struct mcu          *mcu,
+	const struct config *cfg,
+	struct mcu_state    *state
+)
+{
+	size_t  i;
+	int     ret = 0;
+	uint8_t cmd[11];
+
+	/* TODO: we don't use a mapping at this point, just straight 1-1 */
+
+	cmd[0x0] = 0x48;
+	cmd[0x1] = 0x00;
+
+	for (i = 0; ret == 0 && i < cfg->port_count; i+= 8) {
+		cmd[0x2] = i;
+		cmd[0x3] = i + 0;
+		cmd[0x4] = i + 1;
+		cmd[0x5] = i + 2;
+		cmd[0x6] = i + 3;
+		cmd[0x7] = i + 4;
+		cmd[0x8] = i + 5;
+		cmd[0x9] = i + 6;
+		cmd[0xa] = i + 7;
+		ret = mcu_queue_cmd(mcu, cmd, sizeof(cmd));
+	}
+
+	state->ledmap_updsent = 1;
+	return ret;
 }
 
 /* 0x49 - Get port LED map */
@@ -566,7 +651,11 @@ static int poe_reply_port_led_map(struct mcu_state *state, uint8_t *reply)
 {
 	struct port_led_map *map = &state->ledmaps[reply[0x2] / 8];
 
+	state->ledmap_msgseen = 1;
+
 	map->offset = reply[0x2];
+	if (map->offset % 8 != 0)
+		return 1;  /* error, don't set ports */
 
 	/* unroll the loop, it's always going to be 8 and not worth the
 	 * effort to set it programmatically */
@@ -839,17 +928,67 @@ static void state_timeout_cb(struct uloop_timeout *t)
 	struct mcu *mcu = &poe->mcu;
 	size_t i;
 
+	/* skip this iteration if we're still busy processing the queue */
+	if (!list_empty(&mcu->pending_cmds)) {
+		uloop_timeout_set(t, 1 * 1000);
+		return;
+	}
+
 	poe_cmd_power_stats(mcu);
-	poe_cmd_system_led_config(mcu);
+	if (!mcu->state.sysled_msgseen)
+		poe_cmd_system_led_config(mcu);
+	if (!mcu->state.portled_msgseen)
+		poe_cmd_port_led_config(mcu);
 
 	for (i = 0; i < cfg->port_count; i += 4)
 		poe_cmd_4_port_status(mcu, i, i + 1, i + 2, i + 3);
 
 	for (i = 0; i < cfg->port_count; i++) {
 		poe_cmd_port_power_stats(mcu, i);
-		poe_cmd_port_led_config(mcu, i);
-		poe_cmd_port_led_map(mcu, i);
+		if (!mcu->state.ledmap_msgseen)
+			poe_cmd_port_led_map(mcu, i);
 	}
+
+#ifdef ENABLE_MODIFICATIONS
+	/* to set port LED config, we need some arch-specific details that
+	 * also cannot be expected to be coming from config: e.g. like
+	 * endianness -- we wait here until poe_cmd_port_led_config has
+	 * yielded a response, and then enable the LEDs if necessary */
+	if (mcu->state.portled_msgseen &&
+		!mcu->state.portled_updsent)
+	{
+		ulog(LOG_INFO, "(re)enabling PoE port LED activation\n");
+		mcu->state.portledconfig.enable = 1;
+		poe_set_port_led_config(mcu, &mcu->state);
+		mcu->state.portled_msgseen = 0;
+	}
+
+	if (mcu->state.ledmap_msgseen && mcu->state.ledmaps[0].offset != 0) {
+		/* map was retrieved, but doesn't contain valid info, try
+		 * enabling the mapping if it is disabled */
+		if (mcu->state.sysled_msgseen &&
+			!mcu->state.sysledconfig.map_enable &&
+			!mcu->state.sysled_updsent)
+		{
+			ulog(LOG_INFO, "enabling system PoE portmap usage\n");
+			mcu->state.sysledconfig.map_enable = 1;
+			poe_set_system_led_config(mcu, &mcu->state);
+			/* force refresh of readings */
+			mcu->state.sysled_msgseen = 0;
+			mcu->state.ledmap_msgseen = 0;
+		}
+
+		if (mcu->state.sysled_msgseen &&
+			mcu->state.sysledconfig.map_enable &&
+			!mcu->state.ledmap_updsent)
+		{
+			ulog(LOG_INFO, "defining PoE portmap\n");
+			poe_set_port_led_map(mcu, cfg, &mcu->state);
+			/* force refresh of reading */
+			mcu->state.ledmap_msgseen = 0;
+		}
+	}
+#endif
 
 	uloop_timeout_set(t, 2 * 1000);
 }
@@ -1183,8 +1322,8 @@ int main(int argc, char **argv)
 	if (poe_stream_open("/dev/ttyS1", &poe.mcu.stream, B19200) < 0)
 		return -1;
 
-
 	poe_initial_setup(&poe.mcu, &poe.config);
+
 	uloop_timeout_set(&poe.state_timeout, 1000);
 	uloop_run();
 	uloop_done();
