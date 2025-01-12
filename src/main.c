@@ -716,8 +716,10 @@ static int poe_port_setup(struct mcu* mcu, const struct config *cfg)
 
 	poet_setup(mcu, cfg->ports, cfg->port_count);
 
-	for (i = 0; i < cfg->port_count; i++)
+	for (i = 0; i < cfg->port_count; i++) {
 		poe_cmd_port_enable(mcu, i, !!cfg->ports[i].enable);
+		poe_cmd_port_ext_config(mcu, i);
+	}
 
 	return 0;
 }
@@ -760,7 +762,6 @@ static void state_timeout_cb(struct uloop_timeout *t)
 		poe_cmd_4_port_status(mcu, i, i + 1, i + 2, i + 3);
 
 	for (i = 0; i < cfg->port_count; i++) {
-		poe_cmd_port_ext_config(mcu, i);
 		poe_cmd_port_power_stats(mcu, i);
 	}
 
